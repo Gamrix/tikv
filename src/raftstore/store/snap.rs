@@ -35,7 +35,6 @@ use raftstore::store::Msg;
 use raftstore::store::util::check_key_in_region;
 use storage::{CfName, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use util::transport::SendCh;
-use util::io_limiter::{IOLimiter, LimitWriter};
 use util::HandyRwLock;
 use util::collections::{HashMap, HashMapEntry as Entry};
 use util::codec::bytes::{BytesEncoder, CompactBytesDecoder};
@@ -337,7 +336,6 @@ pub struct Snap {
     cf_index: usize,
     meta_file: MetaFile,
     size_track: Arc<RwLock<u64>>,
-    limiter: Option<Arc<IOLimiter>>,
 }
 
 impl Snap {
@@ -348,7 +346,6 @@ impl Snap {
         is_sending: bool,
         to_build: bool,
         deleter: Box<SnapshotDeleter>,
-        limiter: Option<Arc<IOLimiter>>,
     ) -> RaftStoreResult<Snap> {
         let dir_path = dir.into();
         if !dir_path.exists() {
@@ -392,7 +389,6 @@ impl Snap {
             cf_index: 0,
             meta_file: meta_file,
             size_track: size_track,
-            limiter: limiter,
         };
 
         // load snapshot meta if meta_file exists
@@ -424,9 +420,8 @@ impl Snap {
         snap: &DbSnapshot,
         size_track: Arc<RwLock<u64>>,
         deleter: Box<SnapshotDeleter>,
-        limiter: Option<Arc<IOLimiter>>,
     ) -> RaftStoreResult<Snap> {
-        let mut s = Snap::new(dir, key, size_track, true, true, deleter, limiter)?;
+        let mut s = Snap::new(dir, key, size_track, true, true, deleter)?;
         s.init_for_building(snap)?;
         Ok(s)
     }
@@ -437,7 +432,7 @@ impl Snap {
         size_track: Arc<RwLock<u64>>,
         deleter: Box<SnapshotDeleter>,
     ) -> RaftStoreResult<Snap> {
-        let mut s = Snap::new(dir, key, size_track, true, false, deleter, None)?;
+        let mut s = Snap::new(dir, key, size_track, true, false, deleter)?;
 
         if !s.exists() {
             // Skip the initialization below if it doesn't exists.
@@ -459,9 +454,8 @@ impl Snap {
         snapshot_meta: SnapshotMeta,
         size_track: Arc<RwLock<u64>>,
         deleter: Box<SnapshotDeleter>,
-        limiter: Option<Arc<IOLimiter>>,
     ) -> RaftStoreResult<Snap> {
-        let mut s = Snap::new(dir, key, size_track, false, false, deleter, limiter)?;
+        let mut s = Snap::new(dir, key, size_track, false, false, deleter)?;
         s.set_snapshot_meta(snapshot_meta)?;
 
         if s.exists() {
@@ -492,7 +486,7 @@ impl Snap {
         size_track: Arc<RwLock<u64>>,
         deleter: Box<SnapshotDeleter>,
     ) -> RaftStoreResult<Snap> {
-        let s = Snap::new(dir, key, size_track, false, false, deleter, None)?;
+        let s = Snap::new(dir, key, size_track, false, false, deleter)?;
         Ok(s)
     }
 
@@ -710,26 +704,14 @@ impl Snap {
             } else {
                 let mut key_count = 0;
                 let mut size = 0;
-                let base = self.limiter
-                    .as_ref()
-                    .map_or(0 as i64, |l| l.get_max_bytes_per_time());
-                let mut bytes: i64 = 0;
                 snap.scan_cf(
                     cf,
                     &begin_key,
                     &end_key,
                     false,
                     &mut |key, value| {
-                        let l = key.len() + value.len();
-                        if let Some(ref limiter) = self.limiter {
-                            if bytes >= base {
-                                bytes = 0;
-                                limiter.request(base);
-                            }
-                            bytes += l as i64;
-                        }
-                        size += l;
                         key_count += 1;
+                        size += key.len() + value.len();
                         self.add_kv(key, value)?;
                         Ok(true)
                     },
@@ -1017,9 +999,8 @@ impl Write for Snap {
                 continue;
             }
 
-            let mut file = LimitWriter::new(self.limiter.clone(), cf_file.file.as_mut().unwrap());
+            let file = cf_file.file.as_mut().unwrap();
             let digest = cf_file.write_digest.as_mut().unwrap();
-
             if next_buf.len() > left {
                 file.write_all(&next_buf[0..left])?;
                 digest.write(&next_buf[0..left]);
@@ -1033,6 +1014,7 @@ impl Write for Snap {
                 return Ok(buf.len());
             }
         }
+
         let n = buf.len() - next_buf.len();
         Ok(n)
     }
@@ -1100,15 +1082,10 @@ pub struct SnapManager {
     // directory to store snapfile.
     core: Arc<RwLock<SnapManagerCore>>,
     ch: Option<SendCh<Msg>>,
-    limiter: Option<Arc<IOLimiter>>,
 }
 
 impl SnapManager {
-    pub fn new<T: Into<String>>(
-        path: T,
-        ch: Option<SendCh<Msg>>,
-        limiter: Option<Arc<IOLimiter>>,
-    ) -> SnapManager {
+    pub fn new<T: Into<String>>(path: T, ch: Option<SendCh<Msg>>) -> SnapManager {
         SnapManager {
             core: Arc::new(RwLock::new(SnapManagerCore {
                 base: path.into(),
@@ -1116,7 +1093,6 @@ impl SnapManager {
                 snap_size: Arc::new(RwLock::new(0)),
             })),
             ch: ch,
-            limiter: limiter,
         }
     }
 
@@ -1216,14 +1192,7 @@ impl SnapManager {
             let core = self.core.rl();
             (core.base.clone(), core.snap_size.clone())
         };
-        let f = Snap::new_for_building(
-            dir,
-            key,
-            snap,
-            snap_size,
-            Box::new(self.clone()),
-            self.limiter.clone(),
-        )?;
+        let f = Snap::new_for_building(dir, key, snap, snap_size, Box::new(self.clone()))?;
         Ok(Box::new(f))
     }
 
@@ -1252,7 +1221,6 @@ impl SnapManager {
             snapshot_data.take_meta(),
             core.snap_size.clone(),
             Box::new(self.clone()),
-            self.limiter.clone(),
         )?;
         Ok(Box::new(f))
     }
@@ -1380,7 +1348,6 @@ mod test {
     use std::fs::{self, File, OpenOptions};
     use std::sync::*;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Arc;
     use tempdir::TempDir;
     use protobuf::Message;
 
@@ -1568,7 +1535,6 @@ mod test {
             &snapshot,
             size_track.clone(),
             deleter.clone(),
-            None,
         ).unwrap();
         // Ensure that this snapshot file doesn't exist before being built.
         assert!(!s1.exists());
@@ -1611,7 +1577,6 @@ mod test {
             snap_data.take_meta(),
             size_track.clone(),
             deleter.clone(),
-            None,
         ).unwrap();
         assert!(!s3.exists());
 
@@ -1687,7 +1652,6 @@ mod test {
             &snapshot,
             size_track.clone(),
             deleter.clone(),
-            None,
         ).unwrap();
         assert!(!s1.exists());
 
@@ -1709,7 +1673,6 @@ mod test {
             &snapshot,
             size_track.clone(),
             deleter.clone(),
-            None,
         ).unwrap();
         assert!(s2.exists());
 
@@ -1836,7 +1799,6 @@ mod test {
             snapshot_meta,
             size_track.clone(),
             deleter,
-            None,
         ).unwrap();
 
         assert!(!to.exists());
@@ -1863,7 +1825,6 @@ mod test {
             &snapshot,
             size_track.clone(),
             deleter.clone(),
-            None,
         ).unwrap();
         assert!(!s1.exists());
 
@@ -1891,7 +1852,6 @@ mod test {
             &snapshot,
             size_track.clone(),
             deleter.clone(),
-            None,
         ).unwrap();
         assert!(!s2.exists());
         s2.build(
@@ -1939,8 +1899,7 @@ mod test {
                 &key,
                 snap_meta,
                 size_track.clone(),
-                deleter.clone(),
-                None,
+                deleter.clone()
             ).is_err()
         );
         assert!(
@@ -1967,7 +1926,6 @@ mod test {
             &snapshot,
             size_track.clone(),
             deleter.clone(),
-            None,
         ).unwrap();
         assert!(!s1.exists());
 
@@ -1995,7 +1953,6 @@ mod test {
             &snapshot,
             size_track.clone(),
             deleter.clone(),
-            None,
         ).unwrap();
         assert!(!s2.exists());
         s2.build(
@@ -2029,8 +1986,7 @@ mod test {
                 &key,
                 snap_data.take_meta(),
                 size_track.clone(),
-                deleter.clone(),
-                None,
+                deleter.clone()
             ).is_err()
         );
     }
@@ -2042,7 +1998,7 @@ mod test {
         let temp_path = temp_dir.path().join("snap1");
         let path = temp_path.to_str().unwrap().to_owned();
         assert!(!temp_path.exists());
-        let mut mgr = SnapManager::new(path, None, None);
+        let mut mgr = SnapManager::new(path, None);
         mgr.init().unwrap();
         assert!(temp_path.exists());
 
@@ -2050,7 +2006,7 @@ mod test {
         let temp_path2 = temp_dir.path().join("snap2");
         let path2 = temp_path2.to_str().unwrap().to_owned();
         File::create(temp_path2).unwrap();
-        mgr = SnapManager::new(path2, None, None);
+        mgr = SnapManager::new(path2, None);
         assert!(mgr.init().is_err());
     }
 
@@ -2058,7 +2014,7 @@ mod test {
     fn test_snap_mgr_v2() {
         let temp_dir = TempDir::new("test-snap-mgr-v2").unwrap();
         let path = temp_dir.path().to_str().unwrap().to_owned();
-        let mgr = SnapManager::new(path.clone(), None, None);
+        let mgr = SnapManager::new(path.clone(), None);
         mgr.init().unwrap();
         assert_eq!(mgr.get_total_snap_size(), 0);
 
@@ -2067,14 +2023,9 @@ mod test {
         let key1 = SnapKey::new(1, 1, 1);
         let size_track = Arc::new(RwLock::new(0));
         let deleter = Box::new(mgr.clone());
-        let mut s1 = Snap::new_for_building(
-            &path,
-            &key1,
-            &snapshot,
-            size_track.clone(),
-            deleter.clone(),
-            None,
-        ).unwrap();
+        let mut s1 =
+            Snap::new_for_building(&path, &key1, &snapshot, size_track.clone(), deleter.clone())
+                .unwrap();
         let mut region = get_test_region(1, 1, 1);
         let mut snap_data = RaftSnapshotData::new();
         snap_data.set_region(region.clone());
@@ -2095,7 +2046,6 @@ mod test {
             snap_data.get_meta().clone(),
             size_track.clone(),
             deleter.clone(),
-            None,
         ).unwrap();
         let n = io::copy(&mut s, &mut s2).unwrap();
         assert_eq!(n, expected_size);
@@ -2104,21 +2054,15 @@ mod test {
         let key2 = SnapKey::new(2, 1, 1);
         region.set_id(2);
         snap_data.set_region(region);
-        let s3 = Snap::new_for_building(
-            &path,
-            &key2,
-            &snapshot,
-            size_track.clone(),
-            deleter.clone(),
-            None,
-        ).unwrap();
+        let s3 =
+            Snap::new_for_building(&path, &key2, &snapshot, size_track.clone(), deleter.clone())
+                .unwrap();
         let s4 = Snap::new_for_receiving(
             &path,
             &key2,
             snap_data.take_meta(),
             size_track.clone(),
             deleter.clone(),
-            None,
         ).unwrap();
 
         assert!(s1.exists());
@@ -2126,7 +2070,7 @@ mod test {
         assert!(!s3.exists());
         assert!(!s4.exists());
 
-        let mgr = SnapManager::new(path, None, None);
+        let mgr = SnapManager::new(path, None);
         mgr.init().unwrap();
         assert_eq!(mgr.get_total_snap_size(), expected_size * 2);
 
@@ -2157,7 +2101,7 @@ mod test {
     fn test_snap_deletion_on_registry() {
         let src_temp_dir = TempDir::new("test-snap-deletion-on-registry-src").unwrap();
         let src_path = src_temp_dir.path().to_str().unwrap().to_owned();
-        let src_mgr = SnapManager::new(src_path.clone(), None, None);
+        let src_mgr = SnapManager::new(src_path.clone(), None);
         src_mgr.init().unwrap();
 
         let src_db_dir = TempDir::new("test-snap-deletion-on-registry-src-db").unwrap();
@@ -2192,7 +2136,7 @@ mod test {
 
         let dst_temp_dir = TempDir::new("test-snap-deletion-on-registry-dst").unwrap();
         let dst_path = dst_temp_dir.path().to_str().unwrap().to_owned();
-        let dst_mgr = SnapManager::new(dst_path.clone(), None, None);
+        let dst_mgr = SnapManager::new(dst_path.clone(), None);
         dst_mgr.init().unwrap();
 
         // Ensure the snapshot being received will not be deleted on GC.
