@@ -14,4 +14,3 @@
 pub mod fmsketch;
 pub mod histogram;
 pub mod analyze;
-pub mod cmsketch;

@@ -49,7 +49,6 @@ extern crate libc;
 extern crate crc;
 extern crate alloc;
 extern crate chrono;
-extern crate zipf;
 #[macro_use]
 extern crate prometheus;
 #[macro_use]
