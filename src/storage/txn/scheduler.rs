@@ -316,10 +316,10 @@ pub struct Scheduler {
     sched_pending_write_threshold: usize,
 
     // worker pool
-    worker_pool: ThreadPool<SchedContext>,
+    worker_pool: ThreadPool<ScheContext>,
 
     // high priority commands will be delivered to this pool
-    high_priority_pool: ThreadPool<SchedContext>,
+    high_priority_pool: ThreadPool<ScheContext>,
 
     has_gc_command: bool,
 
@@ -1001,18 +1001,18 @@ fn process_write_impl(
 }
 
 #[derive(Default)]
-struct SchedContext {
+struct ScheContext {
     stats: HashMap<&'static str, StatisticsSummary>,
 }
 
-impl SchedContext {
+impl ScheContext {
     fn add_statistics(&mut self, cmd_tag: &'static str, stat: &Statistics) {
         let entry = self.stats.entry(cmd_tag).or_insert_with(Default::default);
         entry.add_statistics(stat);
     }
 }
 
-impl ThreadContext for SchedContext {
+impl ThreadContext for ScheContext {
     fn on_tick(&mut self) {
         for (cmd, stat) in self.stats.drain() {
             for (cf, details) in stat.stat.details() {
@@ -1068,7 +1068,7 @@ impl Scheduler {
         ctx.tag
     }
 
-    fn fetch_worker_pool(&self, priority: CommandPri) -> &ThreadPool<SchedContext> {
+    fn fetch_worker_pool(&self, priority: CommandPri) -> &ThreadPool<ScheContext> {
         match priority {
             CommandPri::Low | CommandPri::Normal => &self.worker_pool,
             CommandPri::High => &self.high_priority_pool,
@@ -1098,12 +1098,12 @@ impl Scheduler {
         let worker_pool = self.fetch_worker_pool(cmd.priority());
         let tag = cmd.tag();
         if readcmd {
-            worker_pool.execute(move |ctx: &mut SchedContext| {
+            worker_pool.execute(move |ctx: &mut ScheContext| {
                 let s = process_read(cid, cmd, ch, snapshot);
                 ctx.add_statistics(tag, &s);
             });
         } else {
-            worker_pool.execute(move |ctx: &mut SchedContext| {
+            worker_pool.execute(move |ctx: &mut ScheContext| {
                 let s = process_write(cid, cmd, ch, snapshot);
                 ctx.add_statistics(tag, &s);
             });
