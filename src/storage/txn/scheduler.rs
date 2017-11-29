@@ -190,7 +190,7 @@ pub struct RunningCtx {
     region_id: u64,
     latch_timer: Option<HistogramTimer>,
     _timer: HistogramTimer,
-    slow_timer: Option<SlowTimer>,
+    slow_timer: SlowTimer,
 }
 
 impl RunningCtx {
@@ -217,22 +217,20 @@ impl RunningCtx {
             _timer: SCHED_HISTOGRAM_VEC
                 .with_label_values(&[tag])
                 .start_coarse_timer(),
-            slow_timer: None,
+            slow_timer: SlowTimer::new(),
         }
     }
 }
 
 impl Drop for RunningCtx {
     fn drop(&mut self) {
-        if let Some(ref mut timer) = self.slow_timer {
-            slow_log!(
-                timer,
-                "[region {}] scheduler handle command: {}, ts: {}",
-                self.region_id,
-                self.tag,
-                self.ts
-            );
-        }
+        slow_log!(
+            self.slow_timer,
+            "[region {}] scheduler handle command: {}, ts: {}",
+            self.region_id,
+            self.tag,
+            self.ts
+        );
     }
 }
 
@@ -1205,7 +1203,6 @@ impl Scheduler {
         let ok = self.latches.acquire(&mut ctx.lock, cid);
         if ok {
             ctx.latch_timer.take();
-            ctx.slow_timer = Some(SlowTimer::new());
         }
         ok
     }
